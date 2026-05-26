@@ -1,0 +1,85 @@
+import time
+import random
+import string
+
+def naive_search(txt, pat):
+
+    result=[]
+
+    for i in range(len(txt)-len(pat)+1):
+
+        if txt[i:i+len(pat)] == pat:
+
+            result.append(i)
+
+    return result
+
+
+print("1 - Manual file input")
+print("2 - Random file generation")
+
+choice=int(input("Choice: "))
+
+
+if choice==1:
+
+    txt=input("Enter text: ")
+
+    pat=input("Enter pattern: ")
+
+else:
+
+    length=int(input("Random text length: "))
+
+    pattern_len=int(input("Pattern length: "))
+
+    txt=''.join(random.choice(
+        string.ascii_lowercase)
+
+        for _ in range(length))
+
+    start=random.randint(
+        0,length-pattern_len)
+
+    pat=txt[start:
+            start+pattern_len]
+
+
+
+with open("input1.txt","w") as f:
+
+    f.write(txt)
+
+with open("pattern.txt","w") as f:
+
+    f.write(pat)
+
+
+
+f=open("input1.txt","r")
+
+f2=open("pattern.txt","r")
+
+txt=f.read().strip()
+
+pat=f2.read().strip()
+
+
+stime=time.time()
+
+result=naive_search(txt,pat)
+
+etime=time.time()
+
+print("Text length:",len(txt))
+
+print("Pattern length:",len(pat))
+
+print("Positions:",result)
+
+print("Execution time:",
+      etime-stime)
+
+f.close()
+
+f2.close()
