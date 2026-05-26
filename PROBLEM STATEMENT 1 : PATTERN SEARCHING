@@ -1,0 +1,663 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 1 — Install (run once, then restart kernel if needed)
+# ─────────────────────────────────────────────────────────────────────────────
+import sys
+!{sys.executable} -m pip install PyPDF2 python-docx matplotlib ipywidgets -q
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 2 — Core Imports, Algorithms & Comparison Engine
+# ─────────────────────────────────────────────────────────────────────────────
+import os, time, re
+from collections import Counter
+from difflib import SequenceMatcher
+
+import PyPDF2
+from docx import Document
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+import numpy as np
+
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+
+
+# ══════════════════════════════════════════════════
+# FILE READERS
+# ══════════════════════════════════════════════════
+
+def read_txt(path):
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        return f.read()
+
+def read_pdf(path):
+    text = ''
+    with open(path, 'rb') as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                text += t + '\n'
+    return text
+
+def read_docx(path):
+    doc = Document(path)
+    return '\n'.join(p.text for p in doc.paragraphs)
+
+def load_document(path):
+    ext = os.path.splitext(path)[1].lower()
+    loaders = {'.txt': read_txt, '.pdf': read_pdf, '.docx': read_docx}
+    return loaders.get(ext, lambda p: '')(path)
+
+
+# ══════════════════════════════════════════════════
+# SEARCH ALGORITHMS  (used for benchmark timing)
+# ══════════════════════════════════════════════════
+
+def naive_search(text, pattern):
+    """Brute-force O(n·m) search — returns all match positions."""
+    positions, n, m = [], len(text), len(pattern)
+    for i in range(n - m + 1):
+        if text[i:i+m] == pattern:
+            positions.append(i)
+    return positions
+
+def compute_lps(pattern):
+    """KMP failure / longest-proper-prefix-suffix array."""
+    lps = [0] * len(pattern)
+    length, i = 0, 1
+    while i < len(pattern):
+        if pattern[i] == pattern[length]:
+            length += 1; lps[i] = length; i += 1
+        elif length:
+            length = lps[length - 1]
+        else:
+            i += 1
+    return lps
+
+def kmp_search(text, pattern):
+    """Knuth-Morris-Pratt O(n+m) search."""
+    if not pattern:
+        return []
+    positions, lps = [], compute_lps(pattern)
+    i = j = 0
+    while i < len(text):
+        if pattern[j] == text[i]:
+            i += 1; j += 1
+        if j == len(pattern):
+            positions.append(i - j); j = lps[j - 1]
+        elif i < len(text):
+            if j:
+                j = lps[j - 1]
+            else:
+                i += 1
+    return positions
+
+def rabin_karp_search(text, pattern, d=256, q=101):
+    """Rabin-Karp rolling-hash O(n+m) average search."""
+    positions, n, m = [], len(text), len(pattern)
+    if m > n:
+        return positions
+    h = pow(d, m - 1, q)
+    p = t = 0
+    for i in range(m):
+        p = (d * p + ord(pattern[i])) % q
+        t = (d * t + ord(text[i]))   % q
+    for s in range(n - m + 1):
+        if p == t and text[s:s+m] == pattern:
+            positions.append(s)
+        if s < n - m:
+            t = (d * (t - ord(text[s]) * h) + ord(text[s + m])) % q
+            if t < 0:
+                t += q
+    return positions
+
+
+# ══════════════════════════════════════════════════
+# TEXT HELPERS
+# ══════════════════════════════════════════════════
+
+def tokenize(text, min_len=4):
+    """Extract lowercase alphabetic words of at least min_len characters."""
+    return [w for w in re.findall(r'\b[a-z]{4,}\b', text.lower())
+            if len(w) >= min_len]
+
+def extract_phrases(words, n=3):
+    """Return list of n-gram phrase strings from a word list."""
+    return [' '.join(words[i:i+n]) for i in range(len(words) - n + 1)]
+
+
+# ══════════════════════════════════════════════════
+# FAST COMPARISON ENGINE
+# ══════════════════════════════════════════════════
+
+def run_comparison(text1, text2, algo='kmp', min_len=4):
+    """
+    Compare two documents and return a full result dict.
+
+    Speed strategy:
+    - Similarity metrics use set/Counter operations (instant).
+    - Algorithm timing uses a benchmark sample of 50 words so
+      Naive / KMP / Rabin-Karp times are shown fairly without
+      taking minutes on large documents.
+    """
+    t1 = text1.lower()
+    t2 = text2.lower()
+
+    words1_all = tokenize(t1, min_len)
+    words2_all = tokenize(t2, min_len)
+
+    set1 = set(words1_all)
+    set2 = set(words2_all)
+
+    # ── Fast similarity metrics (set / sequence ops) ─────────────────────────
+    matched_words  = sorted(set1 & set2)           # instant set intersection
+    word_sim       = len(matched_words) / max(len(set1), 1) * 100
+
+    # Character-level on first 8 000 chars each (enough signal, stays fast)
+    char_sim       = SequenceMatcher(None, t1[:8000], t2[:8000]).ratio() * 100
+
+    # 3-gram phrase overlap using sets
+    phrases1       = set(extract_phrases(words1_all))
+    phrases2       = set(extract_phrases(words2_all))
+    shared_phrases = sorted(phrases1 & phrases2)
+    phrase_sim     = len(shared_phrases) / max(len(phrases1), 1) * 100
+
+    combined       = 0.40 * word_sim + 0.35 * char_sim + 0.25 * phrase_sim
+
+    # ── Algorithm benchmark on a 50-word sample ──────────────────────────────
+    # We pick 50 words spread across the matched set so every algo gets
+    # a fair, representative workload — results are proportional to full run.
+    sample_size = min(50, len(matched_words))
+    step        = max(1, len(matched_words) // sample_size)
+    sample      = matched_words[::step][:sample_size]
+
+    # Use a 20 000-char slice of doc2 as the search target for benchmarking
+    bench_text  = t2[:20000]
+
+    search_fns  = {
+        'naive': naive_search,
+        'kmp':   kmp_search,
+        'rabin': rabin_karp_search,
+    }
+    timings = {}
+    for name, fn in search_fns.items():
+        t0 = time.perf_counter()
+        for word in sample:
+            fn(bench_text, word)
+        # Scale timing to what full run would approximately take
+        scale = max(len(matched_words), 1) / max(sample_size, 1)
+        timings[name] = (time.perf_counter() - t0) * scale
+
+    # ── Top matched words by frequency in doc2 ────────────────────────────────
+    freq2       = Counter(words2_all)
+    top_matches = sorted(
+        [(w, freq2[w]) for w in matched_words if freq2[w] > 0],
+        key=lambda x: -x[1]
+    )
+
+    return {
+        'word_sim':        word_sim,
+        'char_sim':        char_sim,
+        'phrase_sim':      phrase_sim,
+        'combined':        combined,
+        'matched_words':   matched_words,
+        'top_matches':     top_matches[:20],
+        'shared_phrases':  shared_phrases[:15],
+        'timings':         timings,
+        'words1_count':    len(set1),
+        'words2_count':    len(set2),
+        'text1_len':       len(text1),
+        'text2_len':       len(text2),
+    }
+
+print('Engine loaded (fast mode) — proceed to Cell 3')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 3 — Visualization Engine  ★ LIGHT THEME — easy to read
+# ─────────────────────────────────────────────────────────────────────────────
+
+PALETTE = {
+    'bg':      '#ffffff',
+    'panel':   '#f6f8fa',
+    'border':  '#d0d7de',
+    'accent1': '#0969da',
+    'accent2': '#1a7f37',
+    'accent3': '#9a6700',
+    'accent4': '#cf222e',
+    'accent5': '#8250df',
+    'text':    '#1f2328',
+    'muted':   '#57606a',
+    'header':  '#0550ae',
+}
+
+def risk_label(score):
+    if score >= 70: return ('HIGH RISK',      PALETTE['accent4'])
+    if score >= 40: return ('MODERATE RISK',  PALETTE['accent3'])
+    if score >= 15: return ('LOW RISK',        '#bc4c00')
+    return              ('LIKELY ORIGINAL',   PALETTE['accent2'])
+
+def plot_results(result, name1, name2):
+    plt.rcParams.update({
+        'figure.facecolor':  PALETTE['bg'],
+        'axes.facecolor':    PALETTE['panel'],
+        'axes.edgecolor':    PALETTE['border'],
+        'axes.labelcolor':   PALETTE['text'],
+        'xtick.color':       PALETTE['text'],
+        'ytick.color':       PALETTE['text'],
+        'text.color':        PALETTE['text'],
+        'grid.color':        PALETTE['border'],
+        'grid.linestyle':    '--',
+        'grid.alpha':        0.7,
+        'font.family':       'DejaVu Sans',
+        'axes.spines.top':   False,
+        'axes.spines.right': False,
+    })
+
+    fig = plt.figure(figsize=(17, 12), facecolor=PALETTE['bg'])
+    fig.suptitle(
+        f'PLAGIARISM ANALYSIS REPORT',
+        fontsize=16, fontweight='bold', color=PALETTE['header'], y=0.99
+    )
+    fig.text(0.5, 0.965,
+        f'{name1}   vs   {name2}',
+        ha='center', fontsize=11, color=PALETTE['muted']
+    )
+
+    gs = GridSpec(2, 3, figure=fig, hspace=0.55, wspace=0.42,
+                  top=0.93, bottom=0.07, left=0.07, right=0.97)
+
+    # ── 1. Similarity Scores ──────────────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    metrics = ['Word\nSimilarity', 'Char\nSimilarity', 'Phrase\nSimilarity', 'Combined\nScore']
+    values  = [result['word_sim'], result['char_sim'], result['phrase_sim'], result['combined']]
+    bar_colors = [PALETTE['accent1'], PALETTE['accent2'], PALETTE['accent3'], PALETTE['accent4']]
+    bars = ax1.barh(metrics, values, color=bar_colors, height=0.52, edgecolor='white', linewidth=0.8)
+    ax1.set_xlim(0, 110)
+    ax1.set_xlabel('Percentage (%)', fontsize=10, color=PALETTE['muted'])
+    ax1.set_title('Similarity Scores', fontweight='bold', fontsize=12, color=PALETTE['text'], pad=12)
+    ax1.axvline(x=40, color=PALETTE['accent3'], linestyle='--', alpha=0.5, linewidth=1.2, label='Moderate (40%)')
+    ax1.axvline(x=70, color=PALETTE['accent4'], linestyle='--', alpha=0.5, linewidth=1.2, label='High (70%)')
+    for bar, val in zip(bars, values):
+        ax1.text(val + 1.5, bar.get_y() + bar.get_height()/2,
+                 f'{val:.1f}%', va='center', fontsize=10,
+                 fontweight='bold', color=PALETTE['text'])
+    ax1.tick_params(labelsize=10)
+    ax1.grid(axis='x', alpha=0.5)
+
+    # ── 2. Algorithm Timing ───────────────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    algo_names  = ['Naive', 'KMP', 'Rabin-Karp']
+    timings     = [result['timings']['naive'], result['timings']['kmp'], result['timings']['rabin']]
+    algo_colors = [PALETTE['accent3'], PALETTE['accent1'], PALETTE['accent2']]
+    bars2 = ax2.bar(algo_names, timings, color=algo_colors, edgecolor='white', width=0.48, linewidth=0.8)
+    ax2.set_ylabel('Time (seconds)', fontsize=10, color=PALETTE['muted'])
+    ax2.set_title('Algorithm Execution Time', fontweight='bold', fontsize=12, color=PALETTE['text'], pad=12)
+    ax2.grid(axis='y', alpha=0.5)
+    fastest = algo_names[timings.index(min(timings))]
+    for bar, t in zip(bars2, timings):
+        ax2.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + max(timings) * 0.02,
+                 f'{t:.4f}s', ha='center', va='bottom',
+                 fontsize=10, fontweight='bold', color=PALETTE['text'])
+    ax2.tick_params(labelsize=10)
+    ax2.text(0.5, 0.97, f'Fastest: {fastest}',
+             transform=ax2.transAxes, ha='center', va='top',
+             fontsize=9, color=PALETTE['accent2'],
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#dafbe1',
+                       edgecolor=PALETTE['accent2'], linewidth=1.2))
+
+    # ── 3. Risk Donut ─────────────────────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    score      = result['combined']
+    risk_lbl, risk_col = risk_label(score)
+    remaining  = 100 - score
+    wedge_colors = [risk_col, '#e6e6e6']
+    wedges, _  = ax3.pie(
+        [score, remaining], colors=wedge_colors,
+        startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.48, edgecolor='white', linewidth=2)
+    )
+    ax3.text(0, 0.12, f'{score:.1f}%',
+             ha='center', va='center', fontsize=26,
+             fontweight='bold', color=risk_col)
+    ax3.text(0, -0.2, risk_lbl,
+             ha='center', va='center', fontsize=11,
+             fontweight='bold', color=risk_col)
+    ax3.text(0, -0.42, 'Combined Score',
+             ha='center', va='center', fontsize=9, color=PALETTE['muted'])
+    ax3.set_title('Plagiarism Risk', fontweight='bold', fontsize=12,
+                  color=PALETTE['text'], pad=12)
+
+    # ── 4. Top Matched Words ──────────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0:2])
+    if result['top_matches']:
+        words_plot = [w for w, _ in result['top_matches'][:15]]
+        freqs_plot = [f for _, f in result['top_matches'][:15]]
+        cmap       = plt.cm.Blues(np.linspace(0.45, 0.9, len(words_plot)))
+        ax4.bar(words_plot, freqs_plot, color=cmap, edgecolor='white', linewidth=0.6)
+        ax4.set_ylabel('Frequency in Doc 2', fontsize=10, color=PALETTE['muted'])
+        ax4.set_title(f'Top {len(words_plot)} Shared Words', fontweight='bold',
+                      fontsize=12, color=PALETTE['text'], pad=12)
+        ax4.tick_params(axis='x', rotation=38, labelsize=9)
+        ax4.tick_params(axis='y', labelsize=10)
+        ax4.grid(axis='y', alpha=0.5)
+        for i, (bar, freq) in enumerate(zip(ax4.patches, freqs_plot)):
+            ax4.text(bar.get_x() + bar.get_width()/2,
+                     bar.get_height() + max(freqs_plot)*0.01,
+                     str(freq), ha='center', va='bottom',
+                     fontsize=8, color=PALETTE['text'])
+    else:
+        ax4.text(0.5, 0.5, 'No shared words found',
+                 ha='center', va='center', transform=ax4.transAxes,
+                 fontsize=12, color=PALETTE['muted'])
+        ax4.set_title('Shared Words', fontweight='bold', fontsize=12, color=PALETTE['text'], pad=12)
+
+    # ── 5. Stats Table ────────────────────────────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 2])
+    ax5.axis('off')
+    col_labels = ['Metric', 'Doc 1', 'Doc 2']
+    row_data   = [
+        ['Characters',    f"{result['text1_len']:,}",   f"{result['text2_len']:,}"],
+        ['Unique Words',  f"{result['words1_count']:,}", f"{result['words2_count']:,}"],
+        ['Matched Words', f"{len(result['matched_words'])}", '—'],
+        ['Shared Phrases',f"{len(result['shared_phrases'])}", '—'],
+        ['Combined Score',f"{result['combined']:.1f}%", '—'],
+    ]
+    tbl = ax5.table(cellText=row_data, colLabels=col_labels,
+                    cellLoc='center', loc='center',
+                    bbox=[0.0, 0.05, 1.0, 0.88])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    for (row, col), cell in tbl.get_celld().items():
+        if row == 0:
+            cell.set_facecolor(PALETTE['header'])
+            cell.set_text_props(color='white', fontweight='bold')
+        elif row % 2 == 0:
+            cell.set_facecolor('#eaf1fb')
+            cell.set_text_props(color=PALETTE['text'])
+        else:
+            cell.set_facecolor(PALETTE['bg'])
+            cell.set_text_props(color=PALETTE['text'])
+        cell.set_edgecolor(PALETTE['border'])
+        cell.set_linewidth(0.5)
+    ax5.set_title('Document Statistics', fontweight='bold', fontsize=12,
+                  color=PALETTE['text'], pad=12)
+
+    import tempfile as _tf
+    _png_path = _tf.gettempdir().replace('\\','/') + '/plagiarism_report.png'
+    plt.savefig(_png_path, dpi=130, bbox_inches='tight', facecolor=PALETTE['bg'])
+    plt.show()
+
+print('Visualization engine loaded (light theme)')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 4 — Interactive UI  ★ FIXED: reads upload widget directly on button click
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os, tempfile
+import ipywidgets as widgets
+from IPython.display import display, HTML
+
+# ── State ─────────────────────────────────────────────────────────────────────
+state = {'text1': '', 'text2': '', 'name1': '', 'name2': '', 'result': None}
+
+BTN_STYLE = dict(button_color='#1f6feb', font_weight='bold')
+RUN_STYLE = dict(button_color='#238636', font_weight='bold')
+EXP_STYLE = dict(button_color='#9e6a03', font_weight='bold')
+CLR_STYLE = dict(button_color='#6e3535', font_weight='bold')
+
+header = widgets.HTML(
+    '<div style="background:#ffffff;padding:18px 24px;border-radius:10px;'
+    'border:1px solid #d0d7de;margin-bottom:12px;">'
+    '<h2 style="color:#0969da;font-family:Courier New,monospace;margin:0;letter-spacing:2px;">'
+    '&#128269; ACADEMIC PLAGIARISM DETECTION SYSTEM</h2>'
+    '<p style="color:#57606a;font-family:monospace;margin:6px 0 0;font-size:13px;">'
+    'Algorithms: Naive &nbsp;&middot;&nbsp; KMP &nbsp;&middot;&nbsp; Rabin-Karp'
+    ' &nbsp;|&nbsp; Supports: TXT &middot; PDF &middot; DOCX</p></div>'
+)
+
+upload1_btn = widgets.FileUpload(accept='.txt,.pdf,.docx', multiple=False,
+    description='Upload Doc 1', style=BTN_STYLE, layout=widgets.Layout(width='190px'))
+upload2_btn = widgets.FileUpload(accept='.txt,.pdf,.docx', multiple=False,
+    description='Upload Doc 2', style=BTN_STYLE, layout=widgets.Layout(width='190px'))
+
+status1 = widgets.HTML('<span style="color:#57606a;font-family:monospace;font-size:12px;">No file selected</span>')
+status2 = widgets.HTML('<span style="color:#57606a;font-family:monospace;font-size:12px;">No file selected</span>')
+
+algo_sel = widgets.ToggleButtons(
+    options=[('Naive', 'naive'), ('KMP', 'kmp'), ('Rabin-Karp', 'rabin')],
+    value='kmp', description='Algorithm:',
+    style={'description_width': '90px', 'button_width': '120px'},
+    layout=widgets.Layout(margin='8px 0')
+)
+minlen_slider = widgets.IntSlider(
+    value=4, min=3, max=10, description='Min word len:',
+    style={'description_width': '100px'},
+    layout=widgets.Layout(width='380px', margin='4px 0')
+)
+
+run_btn    = widgets.Button(description='COMPARE DOCUMENTS', style=RUN_STYLE,
+                             layout=widgets.Layout(width='210px', height='38px'))
+export_btn = widgets.Button(description='Export Report', style=EXP_STYLE,
+                             layout=widgets.Layout(width='140px', height='38px'))
+clear_btn  = widgets.Button(description='Clear', style=CLR_STYLE,
+                             layout=widgets.Layout(width='90px', height='38px'))
+
+progress = widgets.IntProgress(value=0, max=100, bar_style='info',
+    layout=widgets.Layout(width='100%', height='18px', visibility='hidden'))
+out        = widgets.Output()
+phrase_out = widgets.Output()
+
+
+# ── Core helper: extract bytes from FileUpload regardless of ipywidgets version ──
+def _get_upload_bytes(uploader):
+    """Works with ipywidgets 7.x (dict) and 8.x (tuple of dicts)."""
+    val = uploader.value
+    if not val:
+        return None, None
+    if isinstance(val, dict):           # v7: {filename: {content:..., ...}}
+        name    = list(val.keys())[0]
+        content = bytes(val[name]['content'])
+    else:                               # v8: tuple/list of {'name':..,'content':..}
+        item    = val[0] if isinstance(val, (list, tuple)) else list(val.values())[0]
+        name    = item.get('name', 'file')
+        content = bytes(item['content'])
+    return name, content
+
+
+def _ingest(uploader, slot):
+    """Save upload bytes to a temp file, load text, update state."""
+    name, content = _get_upload_bytes(uploader)
+    if name is None:
+        return False
+    ext = os.path.splitext(name)[1].lower()
+    suffix = ext if ext in ('.txt', '.pdf', '.docx') else '.tmp'
+    tmp = tempfile.mktemp(suffix=suffix)
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(content)
+        text = load_document(tmp)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    state[f'text{slot}'] = text
+    state[f'name{slot}'] = name
+    badge = (
+        '<span style="color:#1a7f37;font-family:monospace;font-size:12px;">'
+        f'&#10003; {name} &nbsp;({len(text):,} chars)</span>'
+    )
+    if slot == 1:
+        status1.value = badge
+    else:
+        status2.value = badge
+    return True
+
+
+# Observe changes so status updates immediately when file is chosen
+upload1_btn.observe(lambda c: _ingest(upload1_btn, 1), names='value')
+upload2_btn.observe(lambda c: _ingest(upload2_btn, 2), names='value')
+
+
+def on_run(b):
+    out.clear_output()
+    phrase_out.clear_output()
+
+    # Re-read at click time in case observe callback did not fire
+    if not state['text1']:
+        _ingest(upload1_btn, 1)
+    if not state['text2']:
+        _ingest(upload2_btn, 2)
+
+    if not state['text1'] or not state['text2']:
+        with out:
+            display(HTML(
+                '<div style="background:#fff5f5;border:1px solid #cf222e;'
+                'border-radius:8px;padding:12px 16px;font-family:monospace;">'
+                '<b style="color:#cf222e;">Please upload BOTH documents first.</b><br>'
+                '<span style="color:#57606a;font-size:12px;">'
+                'Use the Upload buttons, wait for the green tick, then click COMPARE.</span></div>'
+            ))
+        return
+
+    progress.layout.visibility = 'visible'
+    progress.value = 20
+
+    with out:
+        display(HTML('<p style="color:#0969da;font-family:monospace;">Analysing...</p>'))
+
+    try:
+        result = run_comparison(
+            state['text1'], state['text2'],
+            algo=algo_sel.value,
+            min_len=minlen_slider.value
+        )
+        state['result'] = result
+        progress.value = 75
+
+        out.clear_output()
+        with out:
+            label, col = risk_label(result['combined'])
+            display(HTML(
+                '<div style="background:#f6f8fa;border:1px solid #d0d7de;'
+                'border-radius:10px;padding:16px 22px;font-family:monospace;">'
+                f'<h3 style="color:{col};margin:0 0 14px;">{label} &nbsp;&mdash;&nbsp;'
+                f' Combined Score: {result["combined"]:.1f}%</h3>'
+                '<table style="color:#1f2328;border-collapse:collapse;width:100%;">'
+                '<tr style="border-bottom:1px solid #30363d;">'
+                '<th style="text-align:left;padding:6px 14px;color:#57606a;">Metric</th>'
+                '<th style="padding:6px 14px;color:#57606a;">Score</th>'
+                '<th style="padding:6px 14px;color:#57606a;">Explanation</th></tr>'
+                f'<tr><td style="padding:6px 14px;">Word Similarity</td>'
+                f'<td style="padding:6px 14px;text-align:center;color:#0969da;font-weight:bold;">{result["word_sim"]:.1f}%</td>'
+                f'<td style="padding:6px 14px;color:#57606a;">Shared vocabulary overlap</td></tr>'
+                f'<tr><td style="padding:6px 14px;">Character Similarity</td>'
+                f'<td style="padding:6px 14px;text-align:center;color:#1a7f37;font-weight:bold;">{result["char_sim"]:.1f}%</td>'
+                f'<td style="padding:6px 14px;color:#57606a;">Sequence-level match</td></tr>'
+                f'<tr><td style="padding:6px 14px;">Phrase Similarity</td>'
+                f'<td style="padding:6px 14px;text-align:center;color:#9a6700;font-weight:bold;">{result["phrase_sim"]:.1f}%</td>'
+                f'<td style="padding:6px 14px;color:#57606a;">3-gram phrase overlap</td></tr>'
+                f'<tr style="border-top:1px solid #30363d;">'
+                f'<td style="padding:8px 14px;font-weight:bold;">Combined Score</td>'
+                f'<td style="padding:8px 14px;text-align:center;color:{col};font-weight:bold;font-size:16px;">{result["combined"]:.1f}%</td>'
+                f'<td style="padding:8px 14px;color:#57606a;">40% word + 35% char + 25% phrase</td></tr>'
+                '</table>'
+                '<hr style="border-color:#30363d;margin:14px 0;">'
+                '<div style="display:flex;gap:36px;">'
+                f'<span>Naive:&nbsp;<b style="color:#9a6700;">{result["timings"]["naive"]:.4f}s</b></span>'
+                f'<span>KMP:&nbsp;<b style="color:#0969da;">{result["timings"]["kmp"]:.4f}s</b></span>'
+                f'<span>Rabin-Karp:&nbsp;<b style="color:#1a7f37;">{result["timings"]["rabin"]:.4f}s</b></span>'
+                f'<span style="color:#57606a;">| Matched: <b style="color:#1f2328;">{len(result["matched_words"])}</b>'
+                f' words &nbsp;| Phrases: <b style="color:#1f2328;">{len(result["shared_phrases"])}</b></span>'
+                '</div></div>'
+            ))
+            plot_results(result, state['name1'], state['name2'])
+
+        with phrase_out:
+            if result['shared_phrases']:
+                rows = ''.join(
+                    f'<tr><td style="padding:5px 12px;border-bottom:1px solid #30363d;">{i+1}</td>'
+                    f'<td style="padding:5px 12px;border-bottom:1px solid #30363d;color:#1f2328;">{ph}</td></tr>'
+                    for i, ph in enumerate(result['shared_phrases'])
+                )
+                display(HTML(
+                    '<div style="background:#f6f8fa;border:1px solid #d0d7de;'
+                    'border-radius:10px;padding:16px;font-family:monospace;margin-top:12px;">'
+                    '<h4 style="color:#0969da;margin:0 0 12px;">Shared 3-Word Phrases (top 15)</h4>'
+                    '<table style="width:100%;">'
+                    '<tr style="color:#57606a;border-bottom:1px solid #30363d;">'
+                    '<th style="text-align:left;padding:4px 12px;">#</th>'
+                    '<th style="text-align:left;padding:4px 12px;">Phrase</th></tr>'
+                    + rows + '</table></div>'
+                ))
+        progress.value = 100
+
+    except Exception as e:
+        with out:
+            display(HTML(
+                '<div style="background:#fff5f5;border:1px solid #cf222e;'
+                f'border-radius:8px;padding:12px;font-family:monospace;">'
+                f'<b style="color:#cf222e;">Error:</b> <span style="color:#1f2328;">{e}</span></div>'
+            ))
+    finally:
+        progress.layout.visibility = 'hidden'
+
+
+def on_export(b):
+    if not state['result']:
+        with out:
+            display(HTML('<p style="color:#cf222e;font-family:monospace;">Run a comparison first.</p>'))
+        return
+    r = state['result']
+    lines = [
+        '=' * 60, 'PLAGIARISM DETECTION REPORT', '=' * 60,
+        f"Document 1 : {state['name1']}", f"Document 2 : {state['name2']}", '',
+        f"Word Similarity   : {r['word_sim']:.2f}%",
+        f"Char Similarity   : {r['char_sim']:.2f}%",
+        f"Phrase Similarity : {r['phrase_sim']:.2f}%",
+        f"Combined Score    : {r['combined']:.2f}%",
+        f"Risk Level        : {risk_label(r['combined'])[0]}", '',
+        f"Naive time    : {r['timings']['naive']:.4f}s",
+        f"KMP time      : {r['timings']['kmp']:.4f}s",
+        f"Rabin time    : {r['timings']['rabin']:.4f}s", '',
+        'TOP MATCHED WORDS:', *[f"  {w} ({f}x)" for w, f in r['top_matches']], '',
+        'SHARED PHRASES:',   *[f"  {p}" for p in r['shared_phrases']], '=' * 60,
+    ]
+    report_text = '\n'.join(lines)
+    import tempfile as _tf
+    out_path = _tf.gettempdir().replace('\\\\','/') + '/plagiarism_report.txt'
+    with open(out_path, 'w') as f:
+        f.write(report_text)
+    with out:
+        display(HTML(f'<p style="color:#1a7f37;font-family:monospace;">Saved to <code>{out_path}</code></p>'))
+        display(HTML(f'<pre style="color:#1f2328;background:#f6f8fa;padding:12px;border-radius:8px;font-size:12px;">{report_text}</pre>'))
+
+
+def on_clear(b):
+    state.update({'text1': '', 'text2': '', 'name1': '', 'name2': '', 'result': None})
+    status1.value = '<span style="color:#57606a;font-family:monospace;font-size:12px;">No file selected</span>'
+    status2.value = '<span style="color:#57606a;font-family:monospace;font-size:12px;">No file selected</span>'
+    out.clear_output()
+    phrase_out.clear_output()
+
+
+run_btn.on_click(on_run)
+export_btn.on_click(on_export)
+clear_btn.on_click(on_clear)
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+upload_row = widgets.HBox([
+    widgets.VBox([upload1_btn, status1], layout=widgets.Layout(margin='0 30px 0 0')),
+    widgets.VBox([upload2_btn, status2]),
+], layout=widgets.Layout(margin='12px 0'))
+
+options_box = widgets.VBox([algo_sel, minlen_slider], layout=widgets.Layout(
+    border='1px solid #30363d', border_radius='8px', padding='12px', margin='8px 0'))
+
+btn_row = widgets.HBox([run_btn, export_btn, clear_btn],
+    layout=widgets.Layout(gap='10px', margin='8px 0'))
+
+app = widgets.VBox([header, upload_row, options_box, btn_row, progress, out, phrase_out],
+    layout=widgets.Layout(padding='16px', max_width='1100px'))
+
+display(app)
