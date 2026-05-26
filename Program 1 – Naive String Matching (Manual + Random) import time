@@ -1,0 +1,53 @@
+import time
+import random
+import string
+
+def naive_search(txt, pat):
+    result = []
+
+    for i in range(len(txt)-len(pat)+1):
+        if txt[i:i+len(pat)] == pat:
+            result.append(i)
+
+    return result
+
+
+print("1 - Manual Input")
+print("2 - Random Generation")
+
+choice = int(input("Choose option: "))
+
+if choice == 1:
+
+    txt = input("Enter text: ")
+    pat = input("Enter pattern: ")
+
+else:
+
+    length = int(input("Random text length: "))
+    pattern_len = int(input("Pattern length: "))
+
+    txt = ''.join(random.choice(string.ascii_lowercase)
+                  for _ in range(length))
+
+    start = random.randint(0, length-pattern_len)
+
+    pat = txt[start:start+pattern_len]
+
+    print("Generated text:")
+    print(txt)
+
+    print("Generated pattern:")
+    print(pat)
+
+
+stime = time.time()
+
+result = naive_search(txt, pat)
+
+etime = time.time()
+
+print("Match positions:", result)
+
+print("Execution time:",
+      etime-stime)
